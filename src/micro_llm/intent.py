@@ -3,20 +3,33 @@
 Le schéma est volontairement étroit. Ce qui n'y figure pas ne peut pas être demandé
 au code d'assemblage : un conteneur privilégié, le socket Docker ou le réseau de l'hôte
 n'ont pas de champ (état dangereux non représentable). Quand la demande en contient,
-le modèle le signale dans `policy_flags`, et c'est l'utilisateur qui tranche (D-009).
+le modèle le signale dans les `policy_flags` du service concerné, et c'est
+l'utilisateur qui tranche (D-009).
 """
 
+from collections import Counter
 from enum import StrEnum
+from graphlib import CycleError, TopologicalSorter
 from typing import Annotated, Self
 
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    StrictBool,
+    StringConstraints,
+    model_validator,
+)
 
-ServiceName = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9-]{0,62}$")]
+# Nom DNS valide : pas de tiret final ni de « -- », 63 caractères au plus.
+ServiceName = Annotated[str, StringConstraints(pattern=r"^[a-z](?:-?[a-z0-9])*$", max_length=63)]
 
-# Image d'un service hors catalogue : nom OCI simple, sans tag ni digest.
+# Image d'un service hors catalogue : nom OCI sans tag ni digest.
 # L'épinglage par digest est fait par le code, jamais par le modèle.
+_OCI_COMPONENT = r"[a-z0-9]+(?:(?:\.|_|__|-+)[a-z0-9]+)*"
 ImageRef = Annotated[
-    str, StringConstraints(pattern=r"^[a-z0-9]+([._/-][a-z0-9]+)*$", max_length=128)
+    str,
+    StringConstraints(pattern=rf"^{_OCI_COMPONENT}(?:/{_OCI_COMPONENT})*$", max_length=128),
 ]
 
 
@@ -32,6 +45,16 @@ class ServiceKind(StrEnum):
     NEXTCLOUD = "nextcloud"
     GITEA = "gitea"
     CUSTOM = "custom"
+
+
+# Une image « custom » ne doit pas contourner une brique durcie du catalogue,
+# ni embarquer Docker lui-même.
+_RESERVED_IMAGE_NAMES = {k.value for k in ServiceKind if k is not ServiceKind.CUSTOM} | {
+    "postgresql",
+    "mysql",
+    "docker",
+    "dind",
+}
 
 
 class Exposure(StrEnum):
@@ -61,56 +84,52 @@ class Service(_Strict):
     kind: ServiceKind
     image: ImageRef | None = None
     exposure: Exposure = Exposure.INTERNAL
-    persistent: bool = False
-    needs_internet: bool = False
+    persistent: StrictBool = False
+    # Besoin propre à l'application ; ceux d'une brique (ACME de Caddy) sont ajoutés par le code.
+    needs_internet: StrictBool = False
     depends_on: tuple[ServiceName, ...] = ()
+    policy_flags: frozenset[PolicyFlag] = frozenset()
 
     @model_validator(mode="after")
-    def _image_only_for_custom(self) -> Self:
-        if self.kind is ServiceKind.CUSTOM and self.image is None:
-            raise ValueError("un service 'custom' doit préciser son image")
-        if self.kind is not ServiceKind.CUSTOM and self.image is not None:
+    def _check(self) -> Self:
+        if self.kind is ServiceKind.CUSTOM:
+            if self.image is None:
+                raise ValueError("un service 'custom' doit préciser son image")
+            if self.image.rsplit("/", 1)[-1] in _RESERVED_IMAGE_NAMES:
+                raise ValueError(
+                    f"l'image '{self.image}' est réservée : utiliser la brique du catalogue"
+                )
+        elif self.image is not None:
             raise ValueError("l'image d'une brique du catalogue est fixée par le code")
-        if self.name in self.depends_on:
-            raise ValueError(f"'{self.name}' dépend de lui-même")
+        repeated = sorted(n for n, c in Counter(self.depends_on).items() if c > 1)
+        if repeated:
+            raise ValueError(f"'{self.name}' : dépendances répétées {repeated}")
         return self
 
 
 class Intent(_Strict):
     services: tuple[Service, ...] = Field(min_length=1, max_length=20)
-    policy_flags: frozenset[PolicyFlag] = frozenset()
 
     @model_validator(mode="after")
     def _consistent_graph(self) -> Self:
-        names = [s.name for s in self.services]
-        duplicates = {n for n in names if names.count(n) > 1}
+        duplicates = sorted(n for n, c in Counter(s.name for s in self.services).items() if c > 1)
         if duplicates:
-            raise ValueError(f"noms de services en double : {sorted(duplicates)}")
-        known = set(names)
+            raise ValueError(f"noms de services en double : {duplicates}")
+        known = {s.name for s in self.services}
         for service in self.services:
             unknown = set(service.depends_on) - known
             if unknown:
                 raise ValueError(
                     f"'{service.name}' dépend de services inconnus : {sorted(unknown)}"
                 )
-        _reject_cycles({s.name: s.depends_on for s in self.services})
+        try:
+            TopologicalSorter({s.name: s.depends_on for s in self.services}).prepare()
+        except CycleError as exc:
+            cycle: list[str] = exc.args[1]
+            raise ValueError(f"dépendance circulaire : {' -> '.join(cycle)}") from exc
         return self
 
-
-def _reject_cycles(graph: dict[str, tuple[str, ...]]) -> None:
-    done: set[str] = set()
-    in_progress: set[str] = set()
-
-    def visit(node: str) -> None:
-        if node in done:
-            return
-        if node in in_progress:
-            raise ValueError(f"dépendance circulaire autour de '{node}'")
-        in_progress.add(node)
-        for dep in graph[node]:
-            visit(dep)
-        in_progress.remove(node)
-        done.add(node)
-
-    for node in graph:
-        visit(node)
+    @property
+    def policy_flags(self) -> frozenset[PolicyFlag]:
+        flags: frozenset[PolicyFlag] = frozenset()
+        return flags.union(*(s.policy_flags for s in self.services))
