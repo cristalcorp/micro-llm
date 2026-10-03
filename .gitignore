@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+dist/
+build/
+# Poids de modèles et jeux de données lourds : jamais dans git
+*.gguf
+*.safetensors
+*.bin
+models/

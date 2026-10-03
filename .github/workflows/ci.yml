@@ -1,0 +1,73 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  # Chaque lundi : une faille publiée dans une dépendance (pip-audit) fait
+  # échouer la CI même si personne n'a poussé de code.
+  schedule:
+    - cron: "0 6 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: Lint, types, tests, security
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c18668ad3cf93ea998bef934396af7bb5c839dc7 # v10.2.0
+        with:
+          version: "0.12.20"
+
+      - name: Sync dependencies
+        run: uv sync --locked
+
+      - name: Ruff
+        run: uv run ruff check .
+
+      - name: Ruff format
+        run: uv run ruff format --check .
+
+      - name: Mypy (strict)
+        run: uv run mypy src tests
+
+      - name: Pytest
+        run: uv run pytest -v
+
+      - name: Bandit (SAST)
+        run: uv run bandit -r src -c pyproject.toml
+
+      - name: pip-audit (vulnérabilités de dépendances)
+        run: uv run pip-audit
+
+  secret-scan:
+    name: Secret scanning (gitleaks)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Install gitleaks (SHA-256 vérifié)
+        env:
+          VERSION: "8.30.1"
+          SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+        run: |
+          curl -sSLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          echo "${SHA256}  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          sudo mv gitleaks /usr/local/bin/gitleaks
+
+      - name: Run gitleaks
+        run: gitleaks detect --source . --redact -v
