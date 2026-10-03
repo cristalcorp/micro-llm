@@ -59,12 +59,14 @@ jobs:
           persist-credentials: false
           fetch-depth: 0
 
+      # -f : une erreur HTTP fait échouer curl au lieu d'enregistrer la page d'erreur ;
+      # --retry : absorbe les erreurs passagères de GitHub (5xx).
       - name: Install gitleaks (SHA-256 vérifié)
         env:
           VERSION: "8.30.1"
           SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
         run: |
-          curl -sSLo gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
+          curl -fsSL --retry 3 --retry-all-errors -o gitleaks.tar.gz "https://github.com/gitleaks/gitleaks/releases/download/v${VERSION}/gitleaks_${VERSION}_linux_x64.tar.gz"
           echo "${SHA256}  gitleaks.tar.gz" | sha256sum -c -
           tar -xzf gitleaks.tar.gz gitleaks
           sudo mv gitleaks /usr/local/bin/gitleaks
